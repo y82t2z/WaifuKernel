@@ -119,7 +119,7 @@ struct menu_device {
 	int		interval_ptr;
 };
 
-static inline int which_bucket(u64 duration_ns, unsigned long nr_iowaiters)
+static inline int which_bucket(unsigned int duration, unsigned long nr_iowaiters)
 {
 	int bucket = 0;
 
@@ -268,13 +268,14 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		       bool *stop_tick)
 {
 	struct menu_device *data = this_cpu_ptr(&menu_devices);
-	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
-	unsigned int predicted_us;
-	u64 predicted_ns;
-	u64 interactivity_req;
+	int latency_req = cpuidle_governor_latency_req(dev->cpu);
+	int i;
+	int first_idx;
+	int idx;
+	unsigned int interactivity_req;
+	unsigned int expected_interval;
 	unsigned long nr_iowaiters;
 	ktime_t delta_next;
-	int i, idx;
 
 	if (data->needs_update) {
 		menu_update(drv, dev);
@@ -300,15 +301,44 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		return 0;
 	}
 
-	/* Round up the result for half microseconds. */
-	predicted_us = div_u64(data->next_timer_ns *
-			       data->correction_factor[data->bucket] +
-			       (RESOLUTION * DECAY * NSEC_PER_USEC) / 2,
-			       RESOLUTION * DECAY * NSEC_PER_USEC);
-	/* Use the lowest expected idle interval to pick the idle state. */
-	predicted_ns = (u64)min(predicted_us,
-				get_typical_interval(data, predicted_us)) *
-				NSEC_PER_USEC;
+	/* determine the expected residency time, round up */
+	data->next_timer_us = ktime_to_us(tick_nohz_get_sleep_length(&delta_next));
+
+	nr_iowaiters = nr_iowait_cpu(dev->cpu);
+	data->bucket = which_bucket(data->next_timer_us, nr_iowaiters);
+
+	/*
+	 * Force the result of multiplication to be 64 bits even if both
+	 * operands are 32 bits.
+	 * Make sure to round up for half microseconds.
+	 */
+	data->predicted_us = DIV_ROUND_CLOSEST_ULL((uint64_t)data->next_timer_us *
+					 data->correction_factor[data->bucket],
+					 RESOLUTION * DECAY);
+
+	expected_interval = get_typical_interval(data);
+	expected_interval = min(expected_interval, data->next_timer_us);
+
+	first_idx = 0;
+	if (drv->states[0].flags & CPUIDLE_FLAG_POLLING) {
+		struct cpuidle_state *s = &drv->states[1];
+		unsigned int polling_threshold;
+
+		/*
+		 * Default to a physical idle state, not to busy polling, unless
+		 * a timer is going to trigger really really soon.
+		 */
+		polling_threshold = max_t(unsigned int, 20, s->target_residency);
+		if (data->next_timer_us > polling_threshold &&
+		    latency_req > s->exit_latency && !s->disabled &&
+		    !dev->states_usage[1].disable)
+			first_idx = 1;
+	}
+
+	/*
+	 * Use the lowest expected idle interval to pick the idle state.
+	 */
+	data->predicted_us = min(data->predicted_us, expected_interval);
 
 	if (tick_nohz_tick_stopped()) {
 		/*
@@ -326,8 +356,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		 * Use the performance multiplier and the user-configurable
 		 * latency_req to determine the maximum exit latency.
 		 */
-		interactivity_req = div64_u64(predicted_ns,
-					      performance_multiplier(nr_iowaiters));
+		interactivity_req = data->predicted_us / performance_multiplier(nr_iowaiters);
 		if (latency_req > interactivity_req)
 			latency_req = interactivity_req;
 	}
